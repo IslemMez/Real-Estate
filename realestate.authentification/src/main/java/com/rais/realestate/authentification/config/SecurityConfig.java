@@ -1,91 +1,114 @@
 package com.rais.realestate.authentification.config;
 
-import org.keycloak.adapters.springboot.KeycloakSpringBootConfigResolver;
-import org.keycloak.adapters.springsecurity.KeycloakConfiguration;
-import org.keycloak.adapters.springsecurity.authentication.KeycloakAuthenticationProvider;
-import org.keycloak.adapters.springsecurity.config.KeycloakWebSecurityConfigurerAdapter;
-import org.keycloak.adapters.springsecurity.filter.KeycloakAuthenticationProcessingFilter;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.keycloak.adapters.springsecurity.authentication.KeycloakLogoutHandler;
 import org.springframework.context.annotation.Bean;
-import org.springframework.http.HttpMethod;
-import org.springframework.security.config.annotation.SecurityBuilder;
-import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
-import org.springframework.security.config.annotation.web.WebSecurityConfigurer;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.builders.WebSecurity;
-import org.springframework.security.core.authority.mapping.SimpleAuthorityMapper;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.authority.mapping.GrantedAuthoritiesMapper;
+import org.springframework.security.core.session.SessionRegistry;
 import org.springframework.security.core.session.SessionRegistryImpl;
+import org.springframework.security.oauth2.core.oidc.user.OidcUserAuthority;
+import org.springframework.security.oauth2.core.user.OAuth2UserAuthority;
+import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.session.RegisterSessionAuthenticationStrategy;
 import org.springframework.security.web.authentication.session.SessionAuthenticationStrategy;
+import org.springframework.security.web.session.HttpSessionEventPublisher;
+import org.springframework.security.web.util.matcher.AntPathRequestMatcher;
 
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
-// Defines all annotations that are needed to integrate Keycloak in Spring Security
-@KeycloakConfiguration
-public class SecurityConfig implements ,  {
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
 
-    @Autowired
-    RestAccessDeniedHandler restAccessDeniedHandler;
+    private static final String GROUPS = "groups";
+    private static final String REALM_ACCESS_CLAIM = "realm_access";
+    private static final String ROLES_CLAIM = "roles";
 
-    @Autowired
-    CustomKeycloakAuthenticationHandler customKeycloakAuthenticationHandler;
+    private final KeycloakLogoutHandler keycloakLogoutHandler;
 
-    @Override
-    public void configure(HttpSecurity http) throws Exception {
-        super.configure(http);
-        http
-                .authorizeHttpRequests((requests) -> requests
-                        .requestMatchers("/login", "/random").permitAll()
-                        .requestMatchers("/visitor").hasRole("visitor")
-                        .requestMatchers("/admin").hasRole("admin")
-                        .anyRequest().authenticated()
-                )
-                .exceptionHandling((exceptions) -> exceptions
-                        .accessDeniedHandler(restAccessDeniedHandler)
-                );
+    SecurityConfig(KeycloakLogoutHandler keycloakLogoutHandler) {
+        this.keycloakLogoutHandler = keycloakLogoutHandler;
     }
 
-    // Disable default role prefix ROLE_
-    @Autowired
-    public void configureGlobal( AuthenticationManagerBuilder auth) throws Exception {
-        KeycloakAuthenticationProvider keycloakAuthenticationProvider = keycloakAuthenticationProvider();
-        keycloakAuthenticationProvider.setGrantedAuthoritiesMapper(new SimpleAuthorityMapper());
-        auth.authenticationProvider(keycloakAuthenticationProvider);
-    }
-
-    // Use Spring Boot property files instead of default keycloak.json
     @Bean
-    public KeycloakSpringBootConfigResolver KeycloakConfigResolver() {
-        return new KeycloakSpringBootConfigResolver();
+    public SessionRegistry sessionRegistry() {
+        return new SessionRegistryImpl();
     }
 
-    // Register authentication strategy for public or confidential applications
     @Bean
-    @Override
     protected SessionAuthenticationStrategy sessionAuthenticationStrategy() {
-        return new RegisterSessionAuthenticationStrategy(new SessionRegistryImpl());
+        return new RegisterSessionAuthenticationStrategy(sessionRegistry());
     }
 
-    //Keycloak auth exception handler
     @Bean
-    @Override
-    protected KeycloakAuthenticationProcessingFilter keycloakAuthenticationProcessingFilter()
-            throws Exception {
-        KeycloakAuthenticationProcessingFilter filter =
-                new KeycloakAuthenticationProcessingFilter(authentication -> {
-                    throw new RuntimeException("Authentication is not supported: " + authentication);
-                });
-        filter.setSessionAuthenticationStrategy(this.sessionAuthenticationStrategy());
-        filter.setAuthenticationFailureHandler(customKeycloakAuthenticationHandler);
-        return filter;
+    public HttpSessionEventPublisher httpSessionEventPublisher() {
+        return new HttpSessionEventPublisher();
     }
 
-    @Override
-    public void init(SecurityBuilder builder) throws Exception {
-
+    @Bean
+    public SecurityFilterChain resourceServerFilterChain(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(auth -> auth
+                .requestMatchers(new AntPathRequestMatcher("/customers*"))
+                .hasRole("user")
+                .requestMatchers(new AntPathRequestMatcher("/"))
+                .permitAll()
+                .anyRequest()
+                .authenticated());
+        http.oauth2ResourceServer((oauth2) -> oauth2
+                .jwt(Customizer.withDefaults()));
+        http.oauth2Login(Customizer.withDefaults())
+                .logout(logout -> logout.addLogoutHandler(keycloakLogoutHandler).logoutSuccessUrl("/"));
+        return http.build();
     }
 
-    @Override
-    public void configure(SecurityBuilder builder) throws Exception {
+    @Bean
+    public GrantedAuthoritiesMapper userAuthoritiesMapperForKeycloak() {
+        return authorities -> {
+            Set<GrantedAuthority> mappedAuthorities = new HashSet<>();
+            var authority = authorities.iterator().next();
+            boolean isOidc = authority instanceof OidcUserAuthority;
 
+            if (isOidc) {
+                var oidcUserAuthority = (OidcUserAuthority) authority;
+                var userInfo = oidcUserAuthority.getUserInfo();
+
+                // Tokens can be configured to return roles under
+                // Groups or REALM ACCESS hence have to check both
+                if (userInfo.hasClaim(REALM_ACCESS_CLAIM)) {
+                    var realmAccess = userInfo.getClaimAsMap(REALM_ACCESS_CLAIM);
+                    var roles = (Collection<String>) realmAccess.get(ROLES_CLAIM);
+                    mappedAuthorities.addAll(generateAuthoritiesFromClaim(roles));
+                } else if (userInfo.hasClaim(GROUPS)) {
+                    Collection<String> roles = (Collection<String>) userInfo.getClaim(
+                            GROUPS);
+                    mappedAuthorities.addAll(generateAuthoritiesFromClaim(roles));
+                }
+            } else {
+                var oauth2UserAuthority = (OAuth2UserAuthority) authority;
+                Map<String, Object> userAttributes = oauth2UserAuthority.getAttributes();
+
+                if (userAttributes.containsKey(REALM_ACCESS_CLAIM)) {
+                    Map<String, Object> realmAccess = (Map<String, Object>) userAttributes.get(
+                            REALM_ACCESS_CLAIM);
+                    Collection<String> roles = (Collection<String>) realmAccess.get(ROLES_CLAIM);
+                    mappedAuthorities.addAll(generateAuthoritiesFromClaim(roles));
+                }
+            }
+            return mappedAuthorities;
+        };
+    }
+
+    Collection<GrantedAuthority> generateAuthoritiesFromClaim(Collection<String> roles) {
+        return roles.stream().map(role -> new SimpleGrantedAuthority("ROLE_" + role)).collect(
+                Collectors.toList());
     }
 }
